@@ -1,0 +1,462 @@
+from bs4 import BeautifulSoup
+import pandas as pd
+import math
+import requests
+import json
+import re
+import os
+import time
+from datetime import datetime
+import time
+from DrissionPage import ChromiumPage
+import urllib3
+import warnings
+from urllib3.exceptions import InsecureRequestWarning
+
+
+
+def clean_header(head):
+    header_dict = {}
+    split_new_line = head.split('\n')
+    for x in split_new_line:
+        if x != '':
+            x = x.lstrip(':').split(': ')
+            header_dict[x[0]] = x[1]
+    for n in header_dict.items():
+        output = f"'{n[0]}': '{n[-1]}',"
+        print(output)
+
+
+def status_log(response=None, url=None, error=None):
+    print(f"Logging status: {response.status_code if response else 'No response'}")
+    if url:
+        print(f"URL: {url}")
+    with open('status_log.txt', 'a', encoding='utf-8') as f:
+        f.write(f"Status: {response.status_code if response else 'No response'}, URL: {url}\n")
+
+
+def retry(func, retries=5):
+    """Decorator function to retry a function call upon connection errors."""
+    def retry_wrapper(*args, **kwargs):
+        attempt = 0
+        while attempt < retries:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                attempt += 1
+                total_time = attempt * 10
+                print(f'Retrying {attempt}: Sleeping for {total_time} seconds, error: {e}')
+                time.sleep(total_time)
+                if attempt == retries:
+                    log_retry_failure(args[0], 'requests.exceptions.ConnectionError')
+        print("Stopped after retries, check network connection")
+        raise SystemExit
+
+    return retry_wrapper
+
+
+def log_retry_failure(url, error_type):
+    '''Log URL and error type after retries are exhausted'''
+    url_log_file = 'url_log.txt'
+    with open(url_log_file, 'a', encoding='utf-8') as file:
+        file.write(f'{url}, {error_type}\n')
+
+
+ses = requests.Session()
+
+
+@retry
+def get_soup_verify(url, headers=None):
+    try:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        warnings.filterwarnings('ignore', category=InsecureRequestWarning)
+        r = ses.get(url, headers=headers, timeout=500, verify=False)
+        r.encoding = r
+    except requests.exceptions.Timeout:
+        print(f'Timeout error for URL: {url}')
+        status_log(url=url)
+        return None
+    if r.status_code == 200:
+        try:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            return soup
+        except:
+            return None
+    elif 499 >= r.status_code >= 400:
+        print(f'client error response, status code {r.status_code} \nrefer: {r.url}')
+        status_log(response=r, url=r.url)
+        return None
+    elif 599 >= r.status_code >= 500:
+        print(f'server error response, status code {r.status_code} \nrefer: {r.url}')
+        count = 1
+        while count != 10:
+            print('while', count)
+            r = requests.Session().get(url, headers=headers, timeout=500, verify=False)
+            print('status_code: ', r.status_code)
+            if r.status_code == 200:
+                try:
+                    soup = BeautifulSoup(r.text, 'html.parser')
+                    return soup
+                except:
+                    return None
+            else:
+                print('retry ', count)
+                count += 1
+                time.sleep(count * 2)
+                status_log(response=r, url=r.url)
+                return None
+
+    else:
+        status_log(response=r, url=r.url)
+        return None
+
+
+
+@retry
+def get_soup(url, headers=None):
+    try:
+        r = ses.get(url, headers=headers, timeout=500)
+        r.encoding = 'utf-8'
+        content = r.content.decode('utf-8', errors='replace')
+    except requests.exceptions.Timeout:
+        print(f'Timeout error for URL: {url}')
+        status_log(url=url, error="Timeout")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f'Request error for URL: {url}. Error: {e}')
+        status_log(url=url, error=str(e))
+        return None
+
+    if r.status_code == 200:
+        try:
+            soup = BeautifulSoup(content, 'html.parser')
+            return soup
+        except Exception as e:
+            print(f'Error parsing HTML: {e}')
+            status_log(url=url, error=f"HTML parsing error: {str(e)}")
+            return None
+    elif 400 <= r.status_code < 500:
+        print(f'Client error response, status code {r.status_code} \nrefer: {r.url}')
+        status_log(response=r, url=r.url, error=f"Client error: {r.status_code}")
+        return None
+    elif 500 <= r.status_code < 600:
+        print(f'Server error response, status code {r.status_code} \nrefer: {r.url}')
+        count = 1
+        while count < 10:
+            print('Retry', count)
+            try:
+                r = ses.get(url, headers=headers, timeout=500)
+                r.encoding = 'utf-8'
+                content = r.content.decode('utf-8', errors='replace')
+                print('Status code:', r.status_code)
+                if r.status_code == 200:
+                    try:
+                        soup = BeautifulSoup(content, 'html.parser')
+                        return soup
+                    except Exception as e:
+                        print(f'Error parsing HTML on retry {count}: {e}')
+                        status_log(url=url, error=f"HTML parsing error on retry {count}: {str(e)}")
+                        return None
+            except requests.exceptions.RequestException as e:
+                print(f'Request error during retry {count}: {e}')
+                status_log(url=url, error=f"Request error on retry {count}: {str(e)}")
+
+            count += 1
+            time.sleep(count * 2)
+
+        status_log(response=r, url=r.url, error="Max retries reached")
+        return None
+    else:
+        status_log(response=r, url=r.url, error=f"Unexpected status code: {r.status_code}")
+        return None
+
+
+@retry
+def post_soup(url, headers=None, payload=None):
+    try:
+        r = ses.post(url, headers=headers, json=payload, timeout=500)
+        r.encoding = 'utf-8'
+        content = r.content.decode('utf-8', errors='replace')
+    except requests.exceptions.Timeout:
+        print(f'Timeout error for URL: {url}')
+        status_log(url=url, error="Timeout")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f'Request error for URL: {url}. Error: {e}')
+        status_log(url=url, error=str(e))
+        return None
+
+    if r.status_code == 200:
+        try:
+            soup = BeautifulSoup(content, 'html.parser')
+            return soup
+        except Exception as e:
+            print(f'Error parsing HTML: {e}')
+            status_log(url=url, error=f"HTML parsing error: {str(e)}")
+            return None
+    elif 400 <= r.status_code < 500:
+        print(f'Client error response, status code {r.status_code} \nrefer: {r.url}')
+        status_log(response=r, url=r.url, error=f"Client error: {r.status_code}")
+        return None
+    elif 500 <= r.status_code < 600:
+        print(f'Server error response, status code {r.status_code} \nrefer: {r.url}')
+        count = 1
+        while count < 10:
+            print('Retry', count)
+            try:
+                r = ses.post(url, headers=headers, json=payload, timeout=500)
+                r.encoding = 'utf-8'
+                content = r.content.decode('utf-8', errors='replace')
+                print('Status code:', r.status_code)
+                if r.status_code == 200:
+                    try:
+                        soup = BeautifulSoup(content, 'html.parser')
+                        return soup
+                    except Exception as e:
+                        print(f'Error parsing HTML on retry {count}: {e}')
+                        status_log(url=url, error=f"HTML parsing error on retry {count}: {str(e)}")
+                        return None
+            except requests.exceptions.RequestException as e:
+                print(f'Request error during retry {count}: {e}')
+                status_log(url=url, error=f"Request error on retry {count}: {str(e)}")
+
+            count += 1
+            time.sleep(count * 2)
+
+        status_log(response=r, url=r.url, error="Max retries reached")
+        return None
+    else:
+        status_log(response=r, url=r.url, error=f"Unexpected status code: {r.status_code}")
+        return None
+
+
+@retry
+def get_json_response(url, headers=None):
+    try:
+        r = ses.get(url, headers=headers, timeout=500)
+        r.encoding = 'utf-8'
+    except requests.exceptions.Timeout:
+        print(f'Timeout error for URL: {url}')
+        status_log(url=url)
+        return None
+    if r.status_code == 200:
+        data_ = r.json()
+        return data_
+    elif 499 >= r.status_code >= 400:
+        print(f'client error response, status code {r.status_code} \nrefer: {r.url}')
+        status_log(response=r, url=r.url)
+        return None
+    elif 599 >= r.status_code >= 500:
+        print(f'server error response, status code {r.status_code} \nrefer: {r.url}')
+        count = 1
+        while count != 10:
+            print('while', count)
+            r = requests.get(url, headers=headers, timeout=500)
+            print('status_code: ', r.status_code)
+            if r.status_code == 200:
+                data_ = r.json()
+                return data_
+            else:
+                print('retry ', count)
+                count += 1
+                time.sleep(count * 2)
+                status_log(response=r, url=r.url)
+                return None
+    else:
+        status_log(response=r, url=r.url)
+        return None
+
+
+@retry
+def post_json_response(url, headers=None, payload=None):
+    try:
+        r = ses.post(url, headers=headers, json=payload, timeout=500)
+        r.encoding = 'utf-8'
+    except requests.exceptions.Timeout:
+        print(f'Timeout error for URL: {url}')
+        status_log(url=url)
+        return None
+    if r.status_code == 200:
+        return r.json()
+    elif 499 >= r.status_code >= 400:
+        print(f'client error response, status code {r.status_code} \nrefer: {r.url}')
+        status_log(response=r, url=r.url)
+        return None
+    elif 599 >= r.status_code >= 500:
+        print(f'server error response, status code {r.status_code} \nrefer: {r.url}')
+        count = 1
+        while count != 10:
+            print('while', count)
+            r = ses.post(url, headers=headers, json=payload, timeout=500)
+            print('status_code: ', r.status_code)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                print('retry ', count)
+                count += 1
+                time.sleep(count * 2)
+                status_log(response=r, url=r.url)
+                return None
+    else:
+        status_log(response=r, url=r.url)
+        return None
+
+
+# class CloudflareBypasser:
+#     def __init__(self, driver: ChromiumPage):
+#         self.driver = driver
+#
+#     def clickCycle(self):
+#         if self.driver.wait.ele_displayed('xpath://div/iframe',timeout=1.5):
+#             time.sleep(1.5)
+#             self.driver('xpath://div/iframe').ele("Verify you are human", timeout=2.5).click()
+#
+#     def isBypassed(self):
+#         title = self.driver.title.lower()
+#         return "just a moment" not in title
+#
+#     def bypass(self):
+#         while not self.isBypassed():
+#             time.sleep(2)
+#             print("Verification page detected.  Trying to bypass...")
+#             time.sleep(2)
+#             self.clickCycle()
+
+# class CloudflareBypasser:
+#     def __init__(self, driver: ChromiumPage):
+#         self.driver = driver
+#
+#     def clickCycle(self):
+#         if self.driver.wait.ele_displayed('#turnstile-wrapper', timeout=1.5):
+#             time.sleep(1.5)
+#             self.driver.ele("#turnstile-wrapper", timeout=2.5).click()
+#
+#     def isBypassed(self):
+#         title = self.driver.title.lower()
+#         return "just a moment" not in title
+#
+#     def bypass(self):
+#         while not self.isBypassed():
+#             time.sleep(2)
+#             print("Verification page detected.  Trying to bypass...")
+#             time.sleep(2)
+#             self.clickCycle()
+
+
+# class CloudflareBypasser:
+#     def __init__(self, driver: ChromiumPage):
+#         self.driver = driver
+#
+#     def clickCycle(self):
+#         if self.driver.wait.ele_displayed('.spacer', timeout=1.5):
+#             time.sleep(1.5)
+#             self.driver.ele(".spacer", timeout=2.5).click()
+#
+#     def isBypassed(self):
+#         title = self.driver.title.lower()
+#         return "just a moment" not in title
+#
+#     def bypass(self):
+#         while not self.isBypassed():
+#             time.sleep(2)
+#             print("Verification page detected.  Trying to bypass...")
+#             time.sleep(2)
+#             self.clickCycle()
+
+
+class CloudflareBypasser:
+    def __init__(self, driver: ChromiumPage, max_retries=-1, log=True):
+        self.driver = driver
+        self.max_retries = max_retries
+        self.log = log
+
+    def search_recursively_shadow_root_with_iframe(self, ele):
+        if ele.shadow_root:
+            if ele.shadow_root.child().tag == "iframe":
+                return ele.shadow_root.child()
+        else:
+            for child in ele.children():
+                result = self.search_recursively_shadow_root_with_iframe(child)
+                if result:
+                    return result
+        return None
+
+    def search_recursively_shadow_root_with_cf_input(self, ele):
+        if ele.shadow_root:
+            if ele.shadow_root.ele("tag:input"):
+                return ele.shadow_root.ele("tag:input")
+        else:
+            for child in ele.children():
+                result = self.search_recursively_shadow_root_with_cf_input(child)
+                if result:
+                    return result
+        return None
+
+    def locate_cf_button(self):
+        button = None
+        eles = self.driver.eles("tag:input")
+        for ele in eles:
+            if "name" in ele.attrs.keys() and "type" in ele.attrs.keys():
+                if "turnstile" in ele.attrs["name"] and ele.attrs["type"] == "hidden":
+                    button = ele.parent().shadow_root.child()("tag:body").shadow_root("tag:input")
+                    break
+
+        if button:
+            return button
+        else:
+            self.log_message("Basic search failed. Searching for button recursively.")
+            ele = self.driver.ele("tag:body")
+            iframe = self.search_recursively_shadow_root_with_iframe(ele)
+            if iframe:
+                button = self.search_recursively_shadow_root_with_cf_input(iframe("tag:body"))
+            else:
+                self.log_message("Iframe not found. Button search failed.")
+            return button
+
+    def log_message(self, message):
+        if self.log:
+            print(message)
+
+    def click_verification_button(self):
+        try:
+            button = self.locate_cf_button()
+            if button:
+                self.log_message("Verification button found. Attempting to click.")
+                button.click()
+            else:
+                self.log_message("Verification button not found.")
+
+        except Exception as e:
+            self.log_message(f"Error clicking verification button: {e}")
+
+    def is_bypassed(self):
+        try:
+            title = self.driver.title.lower()
+            return "just a moment" not in title
+        except Exception as e:
+            self.log_message(f"Error checking page title: {e}")
+            return False
+
+    def bypass(self):
+
+        try_count = 0
+
+        while not self.is_bypassed():
+            if 0 < self.max_retries + 1 <= try_count:
+                self.log_message("Exceeded maximum retries. Bypass failed.")
+                break
+
+            self.log_message(f"Attempt {try_count + 1}: Verification page detected. Trying to bypass...")
+            self.click_verification_button()
+
+            try_count += 1
+            time.sleep(2)
+
+        if self.is_bypassed():
+            self.log_message("Bypass successful.")
+        else:
+            self.log_message("Bypass failed.")
+
+
+def strip_it(text):
+    return re.sub(r"\s+", ' ', text).strip()
